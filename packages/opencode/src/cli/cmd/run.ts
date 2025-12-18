@@ -86,8 +86,17 @@ export const RunCommand = cmd({
         type: "number",
         describe: "port for the local server (defaults to random port if no value provided)",
       })
+      .option("tidy-context-images", {
+        type: "boolean",
+        describe: "replace old images in context with markdown placeholders, keeping only the latest image",
+      })
   },
   handler: async (args) => {
+    // Set tidy-context-images flag if specified via CLI
+    if (args["tidy-context-images"]) {
+      process.env.OPENCODE_TIDY_CONTEXT_IMAGES = "true"
+    }
+
     let message = [...args.message, ...(args["--"] || [])]
       .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
       .join(" ")

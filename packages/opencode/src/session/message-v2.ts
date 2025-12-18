@@ -417,8 +417,53 @@ export namespace MessageV2 {
   })
   export type WithParts = z.infer<typeof WithParts>
 
+  /**
+   * Helper to create a markdown placeholder for an image
+   */
+  function imageToMarkdown(url: string, filename?: string): string {
+    // Extract file:// URL if it's a data URL, otherwise use the original URL
+    let displayUrl = url
+    if (url.startsWith("data:")) {
+      // For data URLs, use filename if available, otherwise indicate it was a data URL
+      displayUrl = filename ? `file://${filename}` : "[data URL]"
+    }
+    const alt = filename || "image"
+    return `![${alt}](${displayUrl})`
+  }
+
+  /**
+   * Check if a MIME type represents an image
+   */
+  function isImageMime(mime: string): boolean {
+    return mime.startsWith("image/")
+  }
+
   export function toModelMessage(input: WithParts[]): ModelMessage[] {
     const result: UIMessage[] = []
+    // Read directly from process.env to support runtime CLI flag setting
+    const tidyImages = process.env.OPENCODE_TIDY_CONTEXT_IMAGES?.toLowerCase() === "true" || process.env.OPENCODE_TIDY_CONTEXT_IMAGES === "1"
+
+    // If tidy-context-images is enabled, find the latest image across all messages
+    let latestImageId: string | null = null
+    if (tidyImages) {
+      // Scan through all messages to find the latest image
+      for (const msg of input) {
+        for (const part of msg.parts) {
+          // Check user file parts
+          if (part.type === "file" && isImageMime(part.mime)) {
+            latestImageId = part.id
+          }
+          // Check tool attachments
+          if (part.type === "tool" && part.state.status === "completed" && part.state.attachments?.length) {
+            for (const attachment of part.state.attachments) {
+              if (isImageMime(attachment.mime)) {
+                latestImageId = attachment.id
+              }
+            }
+          }
+        }
+      }
+    }
 
     for (const msg of input) {
       if (msg.parts.length === 0) continue
@@ -437,13 +482,22 @@ export namespace MessageV2 {
               text: part.text,
             })
           // text/plain and directory files are converted into text parts, ignore them
-          if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory")
-            userMessage.parts.push({
-              type: "file",
-              url: part.url,
-              mediaType: part.mime,
-              filename: part.filename,
-            })
+          if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory") {
+            // If tidy-context-images is enabled and this is an image but not the latest, replace with markdown
+            if (tidyImages && isImageMime(part.mime) && part.id !== latestImageId) {
+              userMessage.parts.push({
+                type: "text",
+                text: imageToMarkdown(part.url, part.filename),
+              })
+            } else {
+              userMessage.parts.push({
+                type: "file",
+                url: part.url,
+                mediaType: part.mime,
+                filename: part.filename,
+              })
+            }
+          }
 
           if (part.type === "compaction") {
             userMessage.parts.push({
@@ -490,6 +544,23 @@ export namespace MessageV2 {
           if (part.type === "tool") {
             if (part.state.status === "completed") {
               if (part.state.attachments?.length) {
+                // Process attachments, replacing old images with markdown if tidy-context-images is enabled
+                const attachmentParts: Array<{ type: "file"; url: string; mediaType: string; filename?: string } | { type: "text"; text: string }> = []
+                for (const attachment of part.state.attachments) {
+                  if (tidyImages && isImageMime(attachment.mime) && attachment.id !== latestImageId) {
+                    attachmentParts.push({
+                      type: "text",
+                      text: imageToMarkdown(attachment.url, attachment.filename),
+                    })
+                  } else {
+                    attachmentParts.push({
+                      type: "file" as const,
+                      url: attachment.url,
+                      mediaType: attachment.mime,
+                      filename: attachment.filename,
+                    })
+                  }
+                }
                 result.push({
                   id: Identifier.ascending("message"),
                   role: "user",
@@ -498,12 +569,7 @@ export namespace MessageV2 {
                       type: "text",
                       text: `Tool ${part.tool} returned an attachment:`,
                     },
-                    ...part.state.attachments.map((attachment) => ({
-                      type: "file" as const,
-                      url: attachment.url,
-                      mediaType: attachment.mime,
-                      filename: attachment.filename,
-                    })),
+                    ...attachmentParts,
                   ],
                 })
               }
