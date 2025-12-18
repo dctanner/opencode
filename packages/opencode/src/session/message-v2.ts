@@ -12,6 +12,7 @@ import { Storage } from "@/storage/storage"
 import { ProviderTransform } from "@/provider/transform"
 import { STATUS_CODES } from "http"
 import { iife } from "@/util/iife"
+import { execSync } from "child_process"
 
 export namespace MessageV2 {
   export const OutputLengthError = NamedError.create("MessageOutputLengthError", z.object({}))
@@ -438,14 +439,110 @@ export namespace MessageV2 {
     return mime.startsWith("image/")
   }
 
+  /**
+   * Parse the tidy-context-images mode from environment variable
+   * Supports: "remove", "scale", "true"/"1" (defaults to "remove")
+   */
+  function getTidyImagesMode(): "remove" | "scale" | null {
+    const value = process.env.OPENCODE_TIDY_CONTEXT_IMAGES?.toLowerCase()
+    if (!value) return null
+    if (value === "remove") return "remove"
+    if (value === "scale") return "scale"
+    // Backwards compatibility: true/1 defaults to remove mode
+    if (value === "true" || value === "1") return "remove"
+    return null
+  }
+
+  /**
+   * Cached result of image scaling tool detection
+   */
+  let cachedScalingTool: string | null | undefined = undefined
+
+  /**
+   * Detect available image scaling CLI tool
+   * Returns the command name or null if none available
+   */
+  function detectScalingTool(): string | null {
+    if (cachedScalingTool !== undefined) return cachedScalingTool
+
+    // Try common image scaling tools in order of preference
+    const tools = ["magick", "convert", "ffmpeg", "sips"]
+
+    for (const tool of tools) {
+      try {
+        execSync(`which ${tool}`, { stdio: "ignore" })
+        cachedScalingTool = tool
+        return tool
+      } catch {
+        // Tool not found, try next
+      }
+    }
+
+    cachedScalingTool = null
+    return null
+  }
+
+  /**
+   * Scale an image using available CLI tool
+   * Returns scaled base64 data URL or original URL if scaling fails
+   */
+  function scaleImage(url: string, mime: string): string {
+    // Only scale data URLs (base64 encoded images)
+    if (!url.startsWith("data:")) return url
+
+    const tool = detectScalingTool()
+    if (!tool) return url
+
+    try {
+      // Extract base64 data from data URL
+      const base64Match = url.match(/^data:[^;]+;base64,(.+)$/)
+      if (!base64Match) return url
+
+      const base64Data = base64Match[1]
+      const inputBuffer = Buffer.from(base64Data, "base64")
+
+      // Scale to max 800px width/height while maintaining aspect ratio
+      let scaledBase64: string
+
+      if (tool === "magick" || tool === "convert") {
+        // ImageMagick: resize to fit within 800x800
+        const result = execSync(`${tool} - -resize 800x800\\> -quality 70 jpeg:-`, {
+          input: inputBuffer,
+          maxBuffer: 50 * 1024 * 1024, // 50MB
+        })
+        scaledBase64 = result.toString("base64")
+        return `data:image/jpeg;base64,${scaledBase64}`
+      } else if (tool === "ffmpeg") {
+        // FFmpeg: scale to fit within 800x800
+        const result = execSync(
+          `ffmpeg -i pipe:0 -vf "scale='min(800,iw)':min'(800,ih)':force_original_aspect_ratio=decrease" -q:v 5 -f image2 -c:v mjpeg pipe:1`,
+          {
+            input: inputBuffer,
+            maxBuffer: 50 * 1024 * 1024,
+            stdio: ["pipe", "pipe", "ignore"],
+          },
+        )
+        scaledBase64 = result.toString("base64")
+        return `data:image/jpeg;base64,${scaledBase64}`
+      } else if (tool === "sips") {
+        // macOS sips: requires temp files, skip for now
+        return url
+      }
+
+      return url
+    } catch {
+      // Scaling failed, return original
+      return url
+    }
+  }
+
   export function toModelMessage(input: WithParts[]): ModelMessage[] {
     const result: UIMessage[] = []
-    // Read directly from process.env to support runtime CLI flag setting
-    const tidyImages = process.env.OPENCODE_TIDY_CONTEXT_IMAGES?.toLowerCase() === "true" || process.env.OPENCODE_TIDY_CONTEXT_IMAGES === "1"
+    const tidyMode = getTidyImagesMode()
 
-    // If tidy-context-images is enabled, find the latest image across all messages
+    // If tidy-context-images is enabled in remove mode, find the latest image across all messages
     let latestImageId: string | null = null
-    if (tidyImages) {
+    if (tidyMode === "remove") {
       // Scan through all messages to find the latest image
       for (const msg of input) {
         for (const part of msg.parts) {
@@ -483,11 +580,22 @@ export namespace MessageV2 {
             })
           // text/plain and directory files are converted into text parts, ignore them
           if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory") {
-            // If tidy-context-images is enabled and this is an image but not the latest, replace with markdown
-            if (tidyImages && isImageMime(part.mime) && part.id !== latestImageId) {
+            const isImage = isImageMime(part.mime)
+            const isLatest = part.id === latestImageId
+
+            if (tidyMode === "remove" && isImage && !isLatest) {
+              // Remove mode: replace old images with markdown
               userMessage.parts.push({
                 type: "text",
                 text: imageToMarkdown(part.url, part.filename),
+              })
+            } else if (tidyMode === "scale" && isImage && !isLatest) {
+              // Scale mode: scale down old images
+              userMessage.parts.push({
+                type: "file",
+                url: scaleImage(part.url, part.mime),
+                mediaType: "image/jpeg", // Scaling converts to JPEG
+                filename: part.filename,
               })
             } else {
               userMessage.parts.push({
@@ -544,13 +652,25 @@ export namespace MessageV2 {
           if (part.type === "tool") {
             if (part.state.status === "completed") {
               if (part.state.attachments?.length) {
-                // Process attachments, replacing old images with markdown if tidy-context-images is enabled
+                // Process attachments based on tidy-context-images mode
                 const attachmentParts: Array<{ type: "file"; url: string; mediaType: string; filename?: string } | { type: "text"; text: string }> = []
                 for (const attachment of part.state.attachments) {
-                  if (tidyImages && isImageMime(attachment.mime) && attachment.id !== latestImageId) {
+                  const isImage = isImageMime(attachment.mime)
+                  const isLatest = attachment.id === latestImageId
+
+                  if (tidyMode === "remove" && isImage && !isLatest) {
+                    // Remove mode: replace old images with markdown
                     attachmentParts.push({
                       type: "text",
                       text: imageToMarkdown(attachment.url, attachment.filename),
+                    })
+                  } else if (tidyMode === "scale" && isImage && !isLatest) {
+                    // Scale mode: scale down old images
+                    attachmentParts.push({
+                      type: "file" as const,
+                      url: scaleImage(attachment.url, attachment.mime),
+                      mediaType: "image/jpeg", // Scaling converts to JPEG
+                      filename: attachment.filename,
                     })
                   } else {
                     attachmentParts.push({
